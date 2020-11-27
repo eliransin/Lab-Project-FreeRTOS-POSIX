@@ -31,11 +31,12 @@
 /* C standard library includes. */
 #include <stddef.h>
 #include <string.h>
+#include <errno.h>
+#include <pthread.h>
 
 /* FreeRTOS+POSIX includes. */
 #include "FreeRTOS_POSIX.h"
-#include "FreeRTOS_POSIX/errno.h"
-#include "FreeRTOS_POSIX/pthread.h"
+
 
 /**
  * @brief Thread attribute object.
@@ -52,6 +53,7 @@ typedef struct pthread_attr_internal
 #define pthreadGET_SCHED_PRIORITY( var )    ( ( var ) & ( pthreadSCHED_PRIORITY_MASK ) )
 #define pthreadIS_JOINABLE( var )           ( ( ( var ) & ( pthreadDETACH_STATE_MASK ) ) == pthreadDETACH_STATE_MASK )
 
+
 /**
  * @brief Thread object.
  */
@@ -65,6 +67,121 @@ typedef struct pthread_internal
     StaticSemaphore_t xJoinMutex;         /**< Ensures that only one other thread may join this thread. */
     void * xReturn;                       /**< Return value of pvStartRoutine. */
 } pthread_internal_t;
+
+typedef struct pthread_key_value {
+    xTaskHandle entry_key;
+    void* value;
+    struct pthread_key_value* next;
+} pthread_key_value_t;
+
+typedef struct pthread_key_entry {    
+    struct pthread_key_entry* next;
+    void (*destructor)(void*);
+    pthread_key_value_t* values;
+} pthread_key_entry_t;
+
+pthread_key_entry_t* keys = NULL;
+
+/* Thread-Specific Data Key Create, P1003.1c/Draft 10, p. 163 */
+
+int	pthread_key_create (pthread_key_t *__key,
+        void (*__destructor)(void *)) {
+            pthread_key_entry_t* k = pvPortMalloc(sizeof(pthread_key_entry_t));
+        if (!k) {
+            return ENOMEM;
+        }
+        vTaskSuspendAll();
+        k->next = keys;
+        k->destructor = __destructor;
+        k->values = NULL;
+        keys = k;
+        xTaskResumeAll();
+        *__key = (pthread_key_t)k;
+        return 0;
+}
+
+/* Thread-Specific Data Management, P1003.1c/Draft 10, p. 165 */
+
+int	pthread_setspecific (pthread_key_t __key, const void *__value) {
+    TaskHandle_t tsk = xTaskGetCurrentTaskHandle();
+    pthread_key_entry_t* ke = (pthread_key_entry_t*)__key;
+    pthread_key_value_t* k = ke->values;
+    vTaskSuspendAll();
+    while((k!=NULL) && (k->entry_key != tsk)) {
+        k = k->next;
+    }
+    if (!k) {
+        k = pvPortMalloc(sizeof(pthread_key_value_t));
+        if (!k) {
+            xTaskResumeAll();
+            return ENOMEM;
+        }
+        k->next = ke->values;
+        ke->values = k;
+    }
+    xTaskResumeAll();
+    k->value = (void*)__value;
+    return 0;
+}
+
+void *	pthread_getspecific (pthread_key_t __key) {
+    TaskHandle_t tsk = xTaskGetCurrentTaskHandle();
+    pthread_key_entry_t* ke = (pthread_key_entry_t*)__key;
+    pthread_key_value_t* k = ke->values;
+    vTaskSuspendAll();
+    while((k!=NULL) && (k->entry_key != tsk)) {
+        k = k->next;
+    }
+    xTaskResumeAll();
+    if (!k) {
+        return NULL;
+    } 
+    return k->value;
+}
+
+/* Thread-Specific Data Key Deletion, P1003.1c/Draft 10, p. 167 */
+
+int	pthread_key_delete (pthread_key_t __key) {    
+    pthread_key_entry_t* ke = NULL;
+    pthread_key_entry_t* ke_prev = NULL;
+    pthread_key_value_t* val;    
+    vTaskSuspendAll();
+    ke = keys;
+    while (( ke != NULL) && (ke != (pthread_key_entry_t*)__key)) {
+        ke_prev = ke;
+        ke = ke->next;
+    }
+    if (!ke) {
+        xTaskResumeAll();
+        return EINVAL;
+    }
+    else if (ke_prev == NULL) {
+        keys = ke->next;
+    } else {
+        ke_prev->next = ke->next;
+    }
+    xTaskResumeAll();
+    val = ke->values;
+    while (val!=NULL) {
+        pthread_key_value_t* tmp = val->next;
+        vPortFree(val);
+        val = tmp;
+    }
+    vPortFree(ke);
+    return 0;
+}
+
+/* Setting Cancelability State, P1003.1c/Draft 10, p. 183 */
+//TODO: implement these
+int	pthread_setcancelstate (int __state, int *__oldstate) {
+    return 0;
+}
+int	pthread_setcanceltype (int __type, int *__oldtype) {
+    return 0;
+}
+void pthread_testcancel (void) {
+    
+}
 
 /**
  * @brief Terminates the calling thread.
@@ -280,6 +397,7 @@ int pthread_attr_setstacksize( pthread_attr_t * attr,
     return iStatus;
 }
 
+
 /*-----------------------------------------------------------*/
 
 int pthread_create( pthread_t * thread,
@@ -298,7 +416,7 @@ int pthread_create( pthread_t * thread,
     {
         /* No memory. */
         iStatus = EAGAIN;
-    }
+    }    
 
     if( iStatus == 0 )
     {
@@ -399,6 +517,10 @@ void pthread_exit( void * value_ptr )
 
     /* Exit this thread. */
     prvExitThread();
+    // this line is added here so the compile will not complain
+    // about returning from the function. Actually the call to the
+    // prvExitThread should not return.
+    exit(0);
 }
 
 /*-----------------------------------------------------------*/
